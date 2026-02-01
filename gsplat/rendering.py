@@ -120,6 +120,7 @@ def rasterization(
     radius_clip: float = 0.0,
     eps2d: float = 0.3,
     sh_degree: Optional[int] = None,
+    sh_viewdir_transform: Optional[Tensor] = None,
     packed: bool = True,
     tile_size: int = 16,
     backgrounds: Optional[Tensor] = None,
@@ -173,6 +174,13 @@ def rasterization(
         shape [..., N, K, 3] or [..., C, N, K, 3], where K is the number of SH bases. In this case, it is expected
         that :math:`(\\textit{sh_degree} + 1) ^ 2 \\leq K`, where `sh_degree` controls the
         activated bases in the SH coefficients.
+
+    .. note::
+        **SH Direction Convention**: By default, SH is evaluated using view directions
+        `(means - camera_center)` in the same frame as `means` (typically world frame).
+        If your SH coefficients expect directions in a different frame, provide a
+        per-Gaussian direction transform `sh_viewdir_transform` to transform view
+        directions before evaluating SH.
 
     .. note::
         **Depth Rendering**: This function supports colors or/and depths via `render_mode`.
@@ -254,6 +262,11 @@ def rasterization(
         sh_degree: The SH degree to use, which can be smaller than the total
             number of bands. If set, the `colors` should be [..., (C,) N, K, 3] SH coefficients,
             else the `colors` should be [..., (C,) N, D] post-activation color values. Default is None.
+        sh_viewdir_transform: Optional per-Gaussian direction transform applied to the
+            view directions before evaluating SH. Expected shape is `[..., N, 3, 3]`
+            (i.e. `batch_dims + (N, 3, 3)`), or `(N, 3, 3)` when `batch_dims == ()`.
+            The multiplication is performed as a row-vector transform: `d' = d @ R`.
+            Default is None.
         packed: Whether to use packed mode which is more memory efficient but might or
             might not be as fast. Default is True.
         tile_size: The size of the tiles for rasterization. Default is 16.
@@ -580,6 +593,31 @@ def rasterization(
                 C,
             )  # [nnz, 3]
 
+            if sh_viewdir_transform is not None:
+                t = sh_viewdir_transform
+                assert t.shape[-2:] == (3, 3), t.shape
+
+                if t.dim() == 3:
+                    # (N, 3, 3), only valid when there is no batch dim.
+                    assert batch_dims == (), (
+                        "sh_viewdir_transform with shape (N,3,3) only supports batch_dims==(). "
+                        f"Got batch_dims={batch_dims}."
+                    )
+                    assert t.shape[0] == N, t.shape
+                    rot = t[gaussian_ids]  # [nnz, 3, 3]
+                elif t.dim() == num_batch_dims + 3:
+                    # batch_dims + (N, 3, 3)
+                    assert t.shape[-3] == N, t.shape
+                    rot = t.reshape(B, N, 3, 3)[batch_ids, gaussian_ids]  # [nnz, 3, 3]
+                else:
+                    raise ValueError(
+                        "Invalid sh_viewdir_transform shape. Expected (N,3,3) when batch_dims==() "
+                        "or batch_dims+(N,3,3). "
+                        f"Got {tuple(t.shape)}."
+                    )
+
+                dirs = torch.matmul(dirs.unsqueeze(-2), rot).squeeze(-2)  # [nnz, 3]
+
             masks = (radii > 0).all(dim=-1)  # [nnz]
             if colors.dim() == num_batch_dims + 3:
                 # Turn [..., N, K, 3] into [nnz, 3]
@@ -592,6 +630,33 @@ def rasterization(
             colors = spherical_harmonics(sh_degree, dirs, shs, masks=masks)  # [nnz, 3]
         else:
             dirs = means[..., None, :, :] - campos[..., None, :]  # [..., C, N, 3]
+
+            if sh_viewdir_transform is not None:
+                t = sh_viewdir_transform
+                assert t.shape[-2:] == (3, 3), t.shape
+
+                if t.dim() == 3:
+                    # (N, 3, 3), only valid when there is no batch dim.
+                    assert batch_dims == (), (
+                        "sh_viewdir_transform with shape (N,3,3) only supports batch_dims==(). "
+                        f"Got batch_dims={batch_dims}."
+                    )
+                    assert t.shape[0] == N, t.shape
+                    rot = t.unsqueeze(0)  # [1, N, 3, 3]
+                elif t.dim() == num_batch_dims + 3:
+                    # batch_dims + (N, 3, 3)
+                    assert t.shape[-3] == N, t.shape
+                    rot = t
+                else:
+                    raise ValueError(
+                        "Invalid sh_viewdir_transform shape. Expected (N,3,3) when batch_dims==() "
+                        "or batch_dims+(N,3,3). "
+                        f"Got {tuple(t.shape)}."
+                    )
+
+                rot = rot[..., None, :, :, :]  # batch_dims + (1, N, 3, 3)
+                rot = torch.broadcast_to(rot, batch_dims + (C, N, 3, 3))
+                dirs = torch.matmul(dirs.unsqueeze(-2), rot).squeeze(-2)  # [..., C, N, 3]
             masks = (radii > 0).all(dim=-1)  # [..., C, N]
             if colors.dim() == num_batch_dims + 3:
                 # Turn [..., N, K, 3] into [..., C, N, K, 3]
